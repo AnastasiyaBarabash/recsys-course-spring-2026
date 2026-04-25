@@ -66,6 +66,8 @@ class Experiments:
     AA = Experiment("AA", Split.HALF_HALF)
     I2I = Experiment("I2I", Split.THREE_WAY)
     HSTU = Experiment("HSTU", Split.HALF_HALF)
+    # A/B test: SasRec-I2I (C) vs RRF/HSTU+SasRec (T1)
+    RRF_VS_SASREC = Experiment("RRF_VS_SASREC", Split.HALF_HALF)
 
     def __init__(self):
-        self.experiments = [Experiments.HSTU]
+        self.experiments = [Experiments.RRF_VS_SASREC]
