@@ -16,6 +16,7 @@ from botify.recommenders.i2i import I2IRecommender
 from botify.recommenders.random import Random
 from botify.recommenders.indexed import Indexed
 from botify.recommenders.sticky_artist import StickyArtist
+from botify.recommenders.rrf import RRFRecommender
 from botify.track import Catalog
 
 root = logging.getLogger()
@@ -74,6 +75,16 @@ sasrec_i2i_recommender = I2IRecommender(
     random_recommender,
 )
 
+# RRF: fuses HSTU (user-based) + SasRec-I2I (item-based) via
+# Reciprocal Rank Fusion scoring. This is the treatment arm.
+rrf_recommender = RRFRecommender(
+    listen_history_redis=listen_history_redis.connection,
+    hstu_redis=recommendations_hstu_redis.connection,
+    i2i_redis=recommendations_contextual_redis.connection,
+    catalog=catalog,
+    fallback=random_recommender,
+)
+
 parser = reqparse.RequestParser()
 parser.add_argument("track", type=int, location="json", required=True)
 parser.add_argument("time", type=float, location="json", required=True)
@@ -112,14 +123,14 @@ class NextTrack(Resource):
         args = parser.parse_args()
         persist_user_listen_history(user, args.track, args.time)
 
-        treatment = Experiments.HSTU.assign(user)
+        # A/B experiment: Control = SasRec-I2I, Treatment = RRF (HSTU + SasRec-I2I)
+        treatment = Experiments.RRF_VS_SASREC.assign(user)
 
-        if treatment == Treatment.C:
-            recommender = sasrec_i2i_recommender
-        elif treatment == Treatment.T1:
-            recommender = Indexed(recommendations_hstu_redis.connection, catalog, random_recommender)
+        if treatment == Treatment.T1:
+            recommender = rrf_recommender
         else:
-            recommender = random_recommender
+            # Control: SasRec-I2I (baseline)
+            recommender = sasrec_i2i_recommender
 
         recommendation = recommender.recommend_next(user, args.track, args.time)
 
