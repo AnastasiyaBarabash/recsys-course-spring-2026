@@ -43,7 +43,6 @@ run:
 	    --data   $(DATA_DIR) \
 	    --output $(DATA_DIR)/ab_result.json
 
-# ── Сброс состояния ──────────────────────────────────────────────────────────
 clean:
 	cd botify && docker compose down -v --remove-orphans 2>/dev/null || true
 	rm -rf $(VENV)

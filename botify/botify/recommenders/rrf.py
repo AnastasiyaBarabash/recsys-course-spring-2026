@@ -29,14 +29,17 @@ class RRFRecommender(Recommender):
     """
     ML ensemble recommender that fuses two neural ranking models:
 
-    1. **HSTU** (Hierarchical Sequential Transduction Units) – user-based
-       pre-computed ranked lists.  Good at capturing *who* the user is.
+    1. Candidate generation from:
+        - HSTU (user model)
+        - SasRec-I2I (item transitions)
 
-    2. **SasRec-I2I** – item-to-item recommendations from a sequential
-       attention model.  Good at capturing *what the session feels like*.
+    2. Feature-based reranking:
+        - i2i rank score
+        - hstu rank score
+        - recency
+        - frequency
 
-    Fusion is done with RRF (k=60 is the standard constant from the paper).
-    The top-N unseen candidate with the highest fused score is returned.
+    Final selection: argmax over weighted sum of features.
     """
 
     def __init__(
@@ -46,105 +49,161 @@ class RRFRecommender(Recommender):
         i2i_redis,
         catalog,
         fallback,
-        rrf_k: int = 60,
         hstu_top: int = 100,
         i2i_top: int = 50,
-        max_anchors: int = 5,
+        max_anchors: int = 3,
+        w_i2i: float = 1.0,
+        w_hstu: float = 0.5,
+        w_recency: float = 0.3,
+        w_freq: float = 0.2,
     ):
         self.listen_history_redis = listen_history_redis
         self.hstu_redis = hstu_redis
         self.i2i_redis = i2i_redis
         self.catalog = catalog
         self.fallback = fallback
-        self.rrf_k = rrf_k
+
         self.hstu_top = hstu_top
         self.i2i_top = i2i_top
         self.max_anchors = max_anchors
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+        self.w_i2i = w_i2i
+        self.w_hstu = w_hstu
+        self.w_recency = w_recency
+        self.w_freq = w_freq
 
     def recommend_next(self, user: int, prev_track: int, prev_track_time: float) -> int:
         history = self._load_history(user)
-        seen_tracks: set = {track for track, _ in history}
+        if not history:
+            return self.fallback.recommend_next(user, prev_track, prev_track_time)
 
-        scores: dict = defaultdict(float)
+        seen_tracks = {t for t, _ in history}
 
-        # ---- Source 1: HSTU user-based ranked list ----
-        self._add_hstu_scores(user, seen_tracks, scores)
+        features = defaultdict(lambda: {
+            "i2i": 0.0,
+            "hstu": 0.0,
+            "recency": 0.0,
+            "freq": 0.0,
+        })
 
-        # ---- Source 2: SasRec-I2I for best anchor tracks ----
-        self._add_i2i_scores(history, seen_tracks, scores)
+        self._add_i2i_features(history, seen_tracks, features)
+        self._add_hstu_features(user, seen_tracks, features)
+        self._add_behavior_features(history, features)
 
-        if scores:
-            best = max(scores, key=lambda t: scores[t])
-            return best
+        if not features:
+            return self.fallback.recommend_next(user, prev_track, prev_track_time)
 
-        return self.fallback.recommend_next(user, prev_track, prev_track_time)
+        best_track = None
+        best_score = -1e9
+
+        for track, f in features.items():
+            score = (
+                self.w_i2i * f["i2i"]
+                + self.w_hstu * f["hstu"]
+                + self.w_recency * f["recency"]
+                + self.w_freq * f["freq"]
+            )
+
+            if score > best_score:
+                best_score = score
+                best_track = track
+
+        return best_track if best_track is not None else \
+            self.fallback.recommend_next(user, prev_track, prev_track_time)
 
     # ------------------------------------------------------------------
-    # Private helpers
+    # Feature builders
     # ------------------------------------------------------------------
 
-    def _add_hstu_scores(self, user: int, seen_tracks: set, scores: dict) -> None:
-        """Add RRF scores from the HSTU user-based ranked list."""
-        data = self.hstu_redis.get(user)
-        if data is None:
-            return
-        hstu_tracks = list(self.catalog.from_bytes(data))
-        rank = 0
-        for track in hstu_tracks:
-            if track in seen_tracks:
-                continue
-            if rank >= self.hstu_top:
-                break
-            scores[track] += 1.0 / (self.rrf_k + rank)
-            rank += 1
-
-    def _add_i2i_scores(
+    def _add_i2i_features(
         self,
         history: List[Tuple[int, float]],
         seen_tracks: set,
-        scores: dict,
-    ) -> None:
-        """Add RRF scores from SasRec-I2I for the most-listened anchor tracks."""
-        if not history:
-            return
+        features: Dict,
+    ):
+        # deterministic anchors: most recent + most listened
+        track_time = defaultdict(float)
+        for t, time in history:
+            track_time[t] += time
 
-        # Aggregate listen time per track
-        track_time: dict = defaultdict(float)
-        for track, t in history:
-            track_time[track] += t
-        total_time = sum(track_time.values()) or 1.0
+        recent_tracks = [t for t, _ in history[-self.max_anchors:]]
+        top_tracks = sorted(track_time, key=lambda x: -track_time[x])[:self.max_anchors]
 
-        # Select top anchors by listen time
-        anchors = sorted(track_time, key=lambda t: -track_time[t])[: self.max_anchors]
+        anchors = list(dict.fromkeys(recent_tracks + top_tracks))
 
         for anchor in anchors:
             data = self.i2i_redis.get(anchor)
             if data is None:
                 continue
-            i2i_tracks = pickle.loads(data)
-            anchor_weight = track_time[anchor] / total_time  # proportional contribution
 
-            rank = 0
-            for raw_track in i2i_tracks:
+            recs = pickle.loads(data)
+
+            for rank, raw_track in enumerate(recs[: self.i2i_top]):
                 candidate = int(raw_track)
                 if candidate in seen_tracks:
                     continue
-                if rank >= self.i2i_top:
-                    break
-                scores[candidate] += anchor_weight / (self.rrf_k + rank)
-                rank += 1
+
+                # normalized rank score (strong top emphasis)
+                score = 1.0 / (1.0 + rank)
+
+                # take max across anchors (important!)
+                features[candidate]["i2i"] = max(
+                    features[candidate]["i2i"],
+                    score
+                )
+
+
+    def _add_hstu_features(self, user: int, seen_tracks: set, features: Dict):
+        data = self.hstu_redis.get(user)
+        if data is None:
+            return
+
+        tracks = list(self.catalog.from_bytes(data))
+
+        for rank, track in enumerate(tracks[: self.hstu_top]):
+            if track in seen_tracks:
+                continue
+
+            score = 1.0 / (1.0 + rank)
+
+            features[track]["hstu"] = score
+
+
+    def _add_behavior_features(
+        self,
+        history: List[Tuple[int, float]],
+        features: Dict,
+    ):
+        track_time = defaultdict(float)
+        last_position = {}
+
+        for idx, (track, t) in enumerate(history):
+            track_time[track] += t
+            last_position[track] = idx
+
+        n = len(history)
+
+        for track in features.keys():
+            if track in last_position:
+                # recency: closer to end → higher
+                features[track]["recency"] = 1.0 - (n - last_position[track]) / n
+
+                # frequency: normalized listening time
+                features[track]["freq"] = track_time[track] / sum(track_time.values())
+            else:
+                features[track]["recency"] = 0.0
+                features[track]["freq"] = 0.0
+
 
     def _load_history(self, user: int) -> List[Tuple[int, float]]:
         key = f"user:{user}:listens"
         raw_entries = self.listen_history_redis.lrange(key, 0, -1)
+
         history = []
         for raw in raw_entries:
             if isinstance(raw, bytes):
                 raw = raw.decode("utf-8")
             entry = json.loads(raw)
             history.append((int(entry["track"]), float(entry["time"])))
+
         return history
