@@ -31,7 +31,6 @@ artists_redis = Redis(app, config_prefix="REDIS_ARTIST")
 listen_history_redis = Redis(app, config_prefix="REDIS_LISTEN_HISTORY")
 recommendations_lfm_redis = Redis(app, config_prefix="REDIS_RECOMMENDATIONS_LFM")
 recommendations_contextual_redis = Redis(app, config_prefix="REDIS_RECOMMENDATIONS_SASREC")
-
 recommendations_hstu_redis = Redis(app, config_prefix="REDIS_RECOMMENDATIONS_HSTU")
 
 data_logger = DataLogger(app)
@@ -129,7 +128,6 @@ class NextTrack(Resource):
         if treatment == Treatment.T1:
             recommender = rrf_recommender
         else:
-            # Control: SasRec-I2I (baseline)
             recommender = sasrec_i2i_recommender
 
         recommendation = recommender.recommend_next(user, args.track, args.time)
@@ -171,7 +169,7 @@ api.add_resource(Track, "/track/<int:track>")
 api.add_resource(NextTrack, "/next/<int:user>")
 api.add_resource(LastTrack, "/last/<int:user>")
 
-app.logger.info(f"Botify service stared")
+app.logger.info(f"Botify service started")
 
 if __name__ == "__main__":
     http_server = WSGIServer(("", 5001), app)
